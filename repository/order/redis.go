@@ -26,13 +26,21 @@ func(r *RedisRepo) Insert(ctx context.Context, order model.Order) error {
 
 	key := orderIDKey(order.OrderID)
 
-	res := r.Client.SetNX(ctx, key, string(data), 0)	
+	txn := r.Client.TxPipeline()
+
+	res := txn.SetNX(ctx, key, string(data), 0)	
 	if err := res.Err(); err != nil {
+		txn.Discard()
 		return fmt.Errorf("failed to set: %w", err)
 	}
 
-	if err := r.Client.SAdd(ctx, "order", key).Err(); err != nil {
+	if err := txn.SAdd(ctx, "orders", key).Err(); err != nil {
+		txn.Discard()
 		return fmt.Errorf("failed to add to orders set: %w", err)
+	}
+
+	if _, err := txn.Exec(ctx); err != nil {
+		return fmt.Errorf("failed to exec: %W", err)
 	}
 
 	return nil
@@ -63,11 +71,24 @@ func(r *RedisRepo) FindByID(ctx context.Context, id uint64) (model.Order, error)
 func(r *RedisRepo) DeleteByID(ctx context.Context, id uint64) error {
 	key := orderIDKey(id)
 
-	err := r.Client.Del(ctx, key).Err()
+	txn := r.Client.TxPipeline()
+
+	err := txn.Del(ctx, key).Err()
 	if errors.Is(err, redis.Nil) {
+		txn.Discard()
 		return ErrNotExist
 	} else if err != nil {
+		txn.Discard()
 		return fmt.Errorf("delete order: %w", err)
+	}
+
+	if err := txn.SRem(ctx, "orders", key).Err(); err != nil {
+		txn.Discard()
+		return fmt.Errorf("failed to remove from orders set: %w", err)
+	}
+
+	if _, err := txn.Exec(ctx); err != nil {
+		return fmt.Errorf("failed to exec: %W", err)
 	}
 
 	return nil
@@ -97,9 +118,47 @@ type FindAllPage struct {
 	Offset	uint
 }
 
-func(r *RedisRepo) FindAll(ctx context.Context) ([]model.Order, error) {
+type FindResult struct {
+	Orders []model.Order
+	Cursor uint64
+}
 
+func(r *RedisRepo) FindAll(ctx context.Context, page FindAllPage) (FindResult, error) {
 
+	res := r.Client.SScan(ctx, "orders", uint64(page.Offset), "*", int64(page.Size))
 
-	return nil, nil
+	keys, cursor, err := res.Result()
+	if err != nil {
+		return FindResult{}, fmt.Errorf("failed to get order ids: %w", err)
+	}
+
+	if len(keys) == 0 {
+		return FindResult{
+			Orders: []model.Order{},			
+		}, nil
+	}
+
+	xs, err := r.Client.MGet(ctx, keys...).Result()
+	if err != nil {
+		return FindResult{}, fmt.Errorf("failed to get orders: %w", err)
+	}
+
+	orders := make([]model.Order, len(xs))
+	
+	for i, x := range xs {
+		x := x.(string)
+		var order model.Order
+
+		err := json.Unmarshal([]byte(x), &order)
+		if err != nil {
+			return FindResult{}, fmt.Errorf("failed to decode order json: %w", err)
+		}
+
+		orders[i] = order
+	}
+
+	return FindResult{
+		Orders: orders,
+		Cursor: cursor,
+	}, nil
 }
